@@ -1,0 +1,48 @@
+path: 3EAK.cif
+
+include:
+  - chain:
+      id: A
+
+design:
+  - chain:
+      id: A
+      res_index: 26..36,54..61,100..117
+
+structure_groups:
+  - group:
+      id: A
+      visibility: 2
+  - group:
+      id: A
+      visibility: 0
+      res_index: 26..36,54..61,100..117
+
+exclude:
+  - chain:
+      id: A
+      res_index: 26..36   # CDR1
+  - chain:
+      id: A
+      res_index: 54..61   # CDR2
+  - chain:
+      id: A
+      res_index: 100..117 # CDR3
+
+design_insertions:
+  - insertion:
+      id: A
+      res_index: 26       # CDR1 start
+      num_residues: 6..8
+  - insertion:
+      id: A
+      res_index: 54        # CDR2 start
+      num_residues: 6..8
+  - insertion:
+      id: A
+      res_index: 100       # CDR3 start
+      num_residues: 16..20
+
+reset_res_index:
+  - chain:
+      id: A
