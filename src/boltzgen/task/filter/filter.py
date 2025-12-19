@@ -1173,18 +1173,19 @@ class Filter(Task):
         )
         seq_sets = [
             (
-                f"All {len(self.df)} {vis}",
+                f"All {len(self.df_full)} {vis}",
+                self.df_full[vis].tolist(),
+            ),
+            (
+                f"Passed {len(self.df)} {vis}",
                 self.df[vis].tolist(),
             ),
             (
-                f"Top {self.top_budget} {vis}",
-                self.df[vis].tolist()[: self.top_budget],
-            ),
-            (
-                f"Diverse {self.budget} {vis}",
+                f"Diverse {len(self.df_div)} {vis}",
                 self.df_div[vis].tolist(),
             ),
         ]
+
         if self.plot_seq_logos:
             for name, sequences in seq_sets:
                 show(create_alignment_logo(sequences, name))
