@@ -194,7 +194,7 @@ class Filter(Task):
             outdir = design_dir
         self.outdir = Path(f"{outdir}") / "final_ranked_designs"
         self.top_dir = self.outdir / f"intermediate_ranked_{top_budget}_designs"
-        self.div_dir = self.outdir / f"final_{budget}_designs"
+        self.div_dir = self.outdir / "final_designs"
         self.outdir.mkdir(parents=True, exist_ok=True)
         self.top_dir.mkdir(parents=True, exist_ok=True)
         self.div_dir.mkdir(parents=True, exist_ok=True)
@@ -315,10 +315,26 @@ class Filter(Task):
         self.filter_df()
         self.absolute_metrics()
         self.sort_df()
+
+        # Save the FULL dataframe (including failed filters) for reporting
+        self.df_full = self.df.copy()
+
+        # Now restrict to only passing designs for final selection
+        self.df = self.df[self.df['pass_filters']].reset_index(drop=True)
+
+        num_pass = len(self.df)
+        if num_pass == 0:
+            raise ValueError("No designs passed all filters — cannot proceed.")
+        
+        print(f"{num_pass} designs passed all filters. Using all of them as final designs.")
+
+        # Override budget to include everything that passed
+        self.budget = num_pass
+
         self.optimize_diversity()
         self.write_outdir()
 
-        # Visualizations
+        # Visualizations — use df_full for "All" statistics, df_div for final set
         print(
             "\nWriting design files is done. Now making plots for a final summary .pdf file with statistics."
         )
@@ -341,7 +357,6 @@ class Filter(Task):
             csv_expl_rows,
             jupyter_nb=jupyter_nb,
         )
-
     def reset_outdir(self):
         if self.outdir.exists():
             shutil.rmtree(self.outdir)
@@ -552,12 +567,12 @@ class Filter(Task):
         self.df = self.df[new_column_order]
 
     def write_outdir(self):
-        num_digits = len(str(len(self.df)))
+        num_digits = len(str(len(self.df_full)))  # Use full set for padding
 
         top_dir2 = self.top_dir / "before_refolding"
         top_dir2.mkdir(parents=True, exist_ok=True)
         for i, (idx, row) in tqdm(
-            enumerate(self.df[: self.top_budget].iterrows()),
+            enumerate(self.df_full[: self.top_budget].iterrows()),
             desc="copy top design files",
         ):
             filename = row["file_name"]
@@ -570,25 +585,29 @@ class Filter(Task):
             dst = self.top_dir / new_filename
             shutil.copy2(src, dst)
 
-        # save to output/diverse_* directory
+        # Copy final (all passing) designs
         self.div_dir.mkdir(parents=True, exist_ok=True)
         div_dir2 = self.div_dir / "before_refolding"
         div_dir2.mkdir(parents=True, exist_ok=True)
-        for i in tqdm(self.diverse_selection, desc="copy diversity files"):
-            src = self.design_dir / self.df_m.loc[i, "file_name"]
-            qualityrank = self.df_m.loc[i, "final_rank"]
+        for i in tqdm(self.diverse_selection, desc="copy final design files"):
+            row = self.df_m.iloc[i]
+            src = self.design_dir / row["file_name"]
+            qualityrank = row["final_rank"]
             filename = src.name
             new_filename = f"rank{qualityrank:0{num_digits}d}_{filename}"
             shutil.copy2(src, div_dir2 / new_filename)
 
-            src = self.design_dir / "refold_cif" / self.df_m.loc[i, "file_name"]
-            shutil.copy2(src, self.div_dir / new_filename)
+            src_refold = self.design_dir / "refold_cif" / row["file_name"]
+            shutil.copy2(src_refold, self.div_dir / new_filename)
+
+        # Save CSVs
         self.df_div.to_csv(
-            self.outdir / f"final_designs_metrics_{self.budget}.csv", index=False
+            self.outdir / "final_designs_metrics.csv", index=False
         )
         print("Files + CSV saved to", self.outdir)
 
-        self.df.to_csv(self.outdir / f"all_designs_metrics.csv", index=False)
+
+        self.df_full.to_csv(self.outdir / "all_designs_metrics.csv", index=False)
 
     def optimize_diversity(self):
         # Load structures and sequences to compute similarities
@@ -791,15 +810,15 @@ class Filter(Task):
 
         avail = [m for m in summary_metrics if m in self.df.columns]
         base_rows = [
-            ["Num designs", len(self.df), "-"],
+            ["Num designs", len(self.df_full), "-"],
         ]
 
         extra_mean = (
             [
                 m,
-                f"{self.df[m].mean():.3f}",  # mean of ALL
-                f"{self.df[: self.top_budget][m].mean():.3f}",  # mean of red set
-                f"{self.df_div[m].mean():.3f}",  # mean of BLUE set
+                f"{self.df_full[m].mean():.3f}",  # mean of ALL
+                f"{self.df_full[: self.top_budget][m].mean():.3f}",  # mean of top
+                f"{self.df_div[m].mean():.3f}",  # mean of final diverse set
             ]
             for m in avail
         )
@@ -818,7 +837,7 @@ class Filter(Task):
 
         metric_rows = [[k, v] for k, v in self.metrics.items()]
 
-        n_total = len(self.df)
+        n_total = len(self.df_full)
         n_pass_filters = (
             int(self.df["pass_filters"].sum()) if "pass_filters" in self.df else n_total
         )
@@ -831,18 +850,18 @@ class Filter(Task):
           {self.div_dir}  
 
         • Metrics and sequences of {self.budget} final designs are in:  
-          {self.outdir}/final_designs_metrics_{self.budget}.csv
+          {self.outdir}/final_designs_metrics.csv
           
         • Metrics of all designs are in:  
           {self.outdir}/all_designs_metrics.csv
 
         You can rerun filtering (very quick), using this command with changed parameters:
             -- boltzgen run input_spec.yaml --steps filtering --config filtering budget=60 alpha=0.05
-        You can also rerun filtering in a jupyter notebook if you want using `filter.ipynb`
+
 
          What was run to produce this in the Filter task:
          1. Filtering: each design is evaluated against mandatory thresholds. 
-         2. Ranking: for every metric we compute its rank, then scale it by the metric’s inverse-importance weight. Designs with fewer passed filters are automatically penalised because the ranking key is the pair (num_filters_passed, metric). The overall quality score is the worst (maximum) of these scaled ranks. The {self.top_budget} best designs form the Top set.
+         2. Ranking: for every metric we compute its rank, then scale it by the metric’s inverse-importance weight. Designs with fewer passed filters are automatically penalised because the ranking key is the pair (num_filters_passed, metric). The {self.top_budget} best designs form the Top set.
          3. Diversity: a lazy-greedy algorithm selects {self.budget} designs that jointly maximise quality and
             minimise sequence similarity (sequence-identity distance). The trade-off is controlled by α = {self.alpha}:
               • α = 0   → 100 % quality focus (same as Top set)
@@ -1185,19 +1204,18 @@ class Filter(Task):
                 """,
         )
         for x, y in extra_pairs:
-            if x in self.df.columns and y in self.df.columns:
+            if x in self.df_full.columns and y in self.df_full.columns:
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.5, 4.5))
-                self._scatter_plus(ax1, self.df, x, y, "All samples")
-                if self.df["pass_filter_rmsd_filter"].sum() > 0:
+                self._scatter_plus(ax1, self.df_full, x, y, "All samples")
+                if "pass_filter_rmsd_filter" in self.df_full.columns and self.df_full["pass_filter_rmsd_filter"].sum() > 0:
                     self._scatter_plus(
                         ax2,
-                        self.df[self.df["pass_filter_rmsd_filter"]],
+                        self.df_full[self.df_full["pass_filter_rmsd_filter"]],
                         x,
                         y,
                         "(Designs passing RMSD threshold)",
                     )
                 show(fig)
-
         section_page(
             "Metric Distributions – Histograms",
             body=(
@@ -1207,23 +1225,26 @@ class Filter(Task):
             ),
         )
         for m in hist_metrics:
-            if m not in self.df.columns:
+            if m not in self.df_full.columns:
                 continue
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.5, 4.5))
             self._hist_plus(
-                ax1, self.df[m], self.df[: self.top_budget][m], self.df_div[m], m, ""
+                ax1,
+                self.df_full[m],
+                self.df_full[: self.top_budget][m],
+                self.df_div[m],
+                m, ""
             )
-            if self.df["pass_filter_rmsd_filter"].sum() > 0:
+            if "pass_filter_rmsd_filter" in self.df_full.columns and self.df_full["pass_filter_rmsd_filter"].sum() > 0:
                 self._hist_plus(
                     ax2,
-                    self.df[self.df["pass_filter_rmsd_filter"]][m],
-                    self.df[: self.top_budget][m],
+                    self.df_full[self.df_full["pass_filter_rmsd_filter"]][m],
+                    self.df_full[: self.top_budget][m],
                     self.df_div[m],
                     m,
                     " (Designs passing RMSD threshold)",
                 )
             show(fig)
-
         if self.num_liability_plots:
             section_page(
                 "Liability Analysis – Developability flags",
@@ -1262,86 +1283,50 @@ class Filter(Task):
             "A description of metrics and summarizing plots was written to:", pdf_path
         )
 
-    def _scatter_plus(self, ax, df, x, y, title=""):
-        ax.scatter(
-            df[x],
-            df[y],
-            color="lightgray",
-            alpha=0.4,
-            s=14,
-            zorder=1,
-        )
+    def _scatter_plus(self, ax, df_all, x, y, title=""):
 
         ax.scatter(
-            self.df[: self.top_budget][x],
-            self.df[: self.top_budget][y],
-            facecolors="none",
-            edgecolors="red",
-            linewidth=1.5,
-            s=30,
-            zorder=2,
-            alpha=0.5,
-            label="top-quality",
+            df_all[x], df_all[y],
+            color="lightgray", alpha=0.4, s=14, zorder=1,
         )
-
+        # Red: top-quality from the full set
+        ax.scatter(
+            self.df_full[: self.top_budget][x],
+            self.df_full[: self.top_budget][y],
+            facecolors="none", edgecolors="red", linewidth=1.5, s=30,
+            zorder=2, alpha=0.5, label="top-quality",
+        )
+        # Blue: final diverse set
         if not self.df_div.empty:
             ax.scatter(
-                self.df_div[x],
-                self.df_div[y],
-                facecolors="none",
-                edgecolors="blue",
-                linewidth=1.5,
-                s=50,  #  ← slightly larger
-                zorder=3,
-                alpha=0.5,
-                label="quality+diversity",
+                self.df_div[x], self.df_div[y],
+                facecolors="none", edgecolors="blue", linewidth=1.5, s=50,
+                zorder=3, alpha=0.5, label="quality+diversity",
             )
-
         ax.set_xlabel(x)
         ax.set_ylabel(y)
         ax.set_title(title)
         ax.legend()
 
     def _hist_plus(self, ax, data_all, data_red, data_blue, metric, suffix):
-        # Check if data contains valid values for histogram
         if data_all is None or len(data_all) == 0 or data_all.isna().all():
-            ax.text(
-                0.5,
-                0.5,
-                f"No valid data for {metric}",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
+            ax.text(0.5, 0.5, f"No valid data for {metric}", ha="center", va="center", transform=ax.transAxes)
             ax.set_xlabel(metric)
             ax.set_ylabel("count")
             ax.set_title(f"{metric}{suffix} (No data)")
             return
 
-        # Filter out NaN values for histogram plotting
         valid_data_all = data_all.dropna()
-        valid_data_red = (
-            data_red.dropna() if data_red is not None else pd.Series(dtype=float)
-        )
-        valid_data_blue = (
-            data_blue.dropna() if data_blue is not None else pd.Series(dtype=float)
-        )
+        valid_data_red = data_red.dropna() if data_red is not None else pd.Series(dtype=float)
+        valid_data_blue = data_blue.dropna() if data_blue is not None else pd.Series(dtype=float)
 
         if len(valid_data_all) == 0:
-            ax.text(
-                0.5,
-                0.5,
-                f"No valid data for {metric}",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-            )
+            ax.text(0.5, 0.5, f"No valid data for {metric}", ha="center", va="center", transform=ax.transAxes)
             ax.set_xlabel(metric)
             ax.set_ylabel("count")
             ax.set_title(f"{metric}{suffix} (No data)")
             return
 
-        # Create histogram with valid data
         ax.hist(valid_data_all, bins=30, color="lightgray", alpha=0.6, label="all")
 
         if len(valid_data_red) > 0:
@@ -1353,7 +1338,7 @@ class Filter(Task):
                 color="red",
                 label="top-quality",
             )
-        if len(data_blue) and len(valid_data_blue) > 0:
+        if len(valid_data_blue) > 0:
             ax.hist(
                 valid_data_blue,
                 bins=30,
