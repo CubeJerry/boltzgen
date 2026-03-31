@@ -22,7 +22,7 @@ dependencies = [
     "pydssp",
     "logomaker",
     "gemmi>=0.6.5",  # Supports both 0.6.x and 0.7.x (see mmcif.py for compatibility layer)
-    "torch>=2.4.1",
+    "torch>=2.4.1, <2.10.0",
     "scikit-learn",
     "hydra-core",
     "edit_distance",
