@@ -324,17 +324,34 @@ class Filter(Task):
 
         num_pass = len(self.df)
         if num_pass == 0:
-            raise ValueError("No designs passed all filters — cannot proceed.")
-        
-        print(f"{num_pass} designs passed all filters. Using all of them as final designs.")
+            print(
+                "No designs passed all filters. Writing outputs and a full report without top-quality overlays."
+            )
+            self.df_m = self.df.copy()
+            self.diverse_selection = []
+            self.df_div = self.df.copy()
+            self.write_outdir()
+            self._write_pipeline_status(
+                status="empty",
+                passed_designs=0,
+                reason="no_designs_passed_filters",
+            )
+        else:
+            print(f"{num_pass} designs passed all filters. Using all of them as final designs.")
+            self._write_pipeline_status(
+                status="ok_with_limited_designs" if num_pass < 2 else "ok",
+                passed_designs=num_pass,
+                reason="single_design_passed_filters" if num_pass == 1 else None,
+            )
 
-        # Override budget to include everything that passed
-        self.budget = num_pass
+            # Override budget to include everything that passed
+            self.budget = num_pass
 
-        self.optimize_diversity()
-        self.write_outdir()
+            self.optimize_diversity()
+            self.write_outdir()
 
         # Visualizations — use df_full for "All" statistics, df_div for final set
+        include_top_candidates = num_pass >= 2
         print(
             "\nWriting design files is done. Now making plots for a final summary .pdf file with statistics."
         )
@@ -346,7 +363,7 @@ class Filter(Task):
             metric_rows,
             intro_text,
             csv_expl_rows,
-        ) = self.prepare_visualization()
+        ) = self.prepare_visualization(include_top_candidates=include_top_candidates)
         self.make_visualization(
             hist_metrics,
             extra_pairs,
@@ -355,8 +372,23 @@ class Filter(Task):
             metric_rows,
             intro_text,
             csv_expl_rows,
+            include_top_candidates=include_top_candidates,
             jupyter_nb=jupyter_nb,
         )
+
+    def _write_pipeline_status(self, status: str, passed_designs: int, reason=None):
+        payload = {
+            "step": "filtering",
+            "status": status,
+            "passed_designs": int(passed_designs),
+            "reason": reason,
+        }
+        status_path = self.outdir / "pipeline_status.json"
+        with open(status_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+        print(f"Pipeline status written to {status_path}")
+
+ 
     def reset_outdir(self):
         if self.outdir.exists():
             shutil.rmtree(self.outdir)
@@ -705,7 +737,7 @@ class Filter(Task):
                     break
         return sorted(selected)
 
-    def prepare_visualization(self):
+    def prepare_visualization(self, include_top_candidates=True):
         summary_metrics = [
             "num_design",
             "filter_rmsd",
@@ -848,27 +880,40 @@ class Filter(Task):
             ["Num designs", len(self.df_full), "-"],
         ]
 
-        extra_mean = (
-            [
-                m,
-                f"{self.df_full[m].mean():.3f}",  # mean of ALL
-                f"{self.df_full[: self.top_budget][m].mean():.3f}",  # mean of top
-                f"{self.df_div[m].mean():.3f}",  # mean of final diverse set
+        if include_top_candidates:
+            extra_mean = (
+                [
+                    m,
+                    f"{self.df_full[m].mean():.3f}",
+                    f"{self.df_full[: self.top_budget][m].mean():.3f}",
+                    f"{self.df_div[m].mean():.3f}",
+                ]
+                for m in avail
+            )
+            for row in base_rows:
+                row.append("-")
+            row_headers = [
+                "Metric",
+                "Mean",
+                f"Mean top {self.top_budget}",
+                f"Mean top {self.budget} diverse",
             ]
-            for m in avail
-        )
-
-        for row in base_rows:
-            row.append("-")
+        else:
+            extra_mean = (
+                [
+                    m,
+                    f"{self.df_full[m].mean():.3f}",
+                    f"{self.df_div[m].mean():.3f}",
+                ]
+                for m in avail
+            )
+            row_headers = [
+                "Metric",
+                "Mean",
+                f"Mean top {self.budget} diverse",
+            ]
 
         rows = base_rows + list(extra_mean)
-
-        row_headers = [
-            "Metric",
-            f"Mean",
-            f"Mean top {self.top_budget}",
-            f"Mean top {self.budget} diverse",
-        ]
 
         metric_rows = [[k, v] for k, v in self.metrics.items()]
 
@@ -896,7 +941,7 @@ class Filter(Task):
 
          What was run to produce this in the Filter task:
          1. Filtering: each design is evaluated against mandatory thresholds. 
-         2. Ranking: for every metric we compute its rank, then scale it by the metric’s inverse-importance weight. Designs with fewer passed filters are automatically penalised because the ranking key is the pair (num_filters_passed, metric). The {self.top_budget} best designs form the Top set.
+         2. Ranking: for every metric we compute its rank, then scale it by the metric’s inverse-importance weight. Designs with fewer passed filters are automatically penalised because the ranking key is the pair (num_filters_passed, metric). {f'The {self.top_budget} best designs form the Top set.' if include_top_candidates else 'Top-set overlays are hidden in this report because too few designs passed filters.'}
          3. Diversity: a lazy-greedy algorithm selects {self.budget} designs that jointly maximise quality and
             minimise sequence similarity (sequence-identity distance). The trade-off is controlled by α = {self.alpha}:
               • α = 0   → 100 % quality focus (same as Top set)
@@ -968,6 +1013,7 @@ class Filter(Task):
         metric_rows,
         intro_text,
         csv_expl_rows,
+        include_top_candidates=True,
         jupyter_nb=False,
     ):
         pdf_path = self.outdir / f"results_overview.pdf"
@@ -980,6 +1026,9 @@ class Filter(Task):
                 fig.set_size_inches(target_w, h * scale, forward=True)
 
         def show(fig):
+            if fig is None:
+                print("Warning: skipped a visualization because no figure was produced.")
+                return
             _ensure_width(fig)
             plt.tight_layout()
             pdf.savefig(fig)
@@ -1179,9 +1228,12 @@ class Filter(Task):
         section_page(
             "Results Summary – Aggregate statistics",
             body=(
-                f"Quick numeric overview comparing (i) ALL incoming designs, (ii) the top-{self.top_budget} highest-quality "
-                f"designs, and (iii) the {self.budget} quality+diversity designs produced by the lazy-greedy "
-                "selection."
+                (
+                    f"Quick numeric overview comparing (i) ALL incoming designs, (ii) the top-{self.top_budget} highest-quality "
+                    f"designs, and (iii) the {self.budget} quality+diversity designs produced by the lazy-greedy selection."
+                    if include_top_candidates
+                    else f"Quick numeric overview comparing (i) ALL incoming designs and (ii) the {self.budget} quality+diversity designs produced by the lazy-greedy selection."
+                )
             ),
         )
         if rows:
@@ -1203,7 +1255,11 @@ class Filter(Task):
                 body=(
                     "Sequence logos display the per-position amino-acid preferences after multiple-sequence alignment, "
                     "highlighting motifs that emerge in the design sets.  The accompanying pies summarise overall "
-                    "hydrophobicity and charge composition comparing ALL, Top-quality (red), and Diversity-optimised subsets. "
+                    + (
+                        "hydrophobicity and charge composition comparing ALL, Top-quality (red), and Diversity-optimised subsets. "
+                        if include_top_candidates
+                        else "hydrophobicity and charge composition comparing ALL and Diversity-optimised subsets. "
+                    )
                 ),
             )
         vis = (
@@ -1241,16 +1297,24 @@ class Filter(Task):
 
         section_page(
             "Scatter Plots – Metric relationships",
-            body="""
+            body=(
+                """
                 Each scatter page contains two panels:
                 • Left – all designs (grey) with overlays of Top (red) and Diverse (blue).
                 • Right – same but limited to designs passing the RMSD filter.
-                """,
+                """
+                if include_top_candidates
+                else """
+                Each scatter page contains two panels:
+                • Left – all designs (grey) with overlays of Diverse (blue).
+                • Right – same but limited to designs passing the RMSD filter.
+                """
+            ),
         )
         for x, y in extra_pairs:
             if x in self.df_full.columns and y in self.df_full.columns:
                 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(8.5, 4.5))
-                self._scatter_plus(ax1, self.df_full, x, y, "All samples")
+                self._scatter_plus(ax1, self.df_full, x, y, "All samples", include_top_candidates=include_top_candidates)
                 if "pass_filter_rmsd_filter" in self.df_full.columns and self.df_full["pass_filter_rmsd_filter"].sum() > 0:
                     self._scatter_plus(
                         ax2,
@@ -1258,14 +1322,19 @@ class Filter(Task):
                         x,
                         y,
                         "(Designs passing RMSD threshold)",
+                        include_top_candidates=include_top_candidates,
                     )
                 show(fig)
         section_page(
             "Metric Distributions – Histograms",
             body=(
-                "Distribution of each metric across all designs (grey) with overlays for Top-quality (red outline) "
-                "and Diversity-optimised (blue dashed) subsets. The right panel repeats the histogram but only for designs "
-                "that pass the RMSD threshold."
+                (
+                    "Distribution of each metric across all designs (grey) with overlays for Top-quality (red outline) "
+                    "and Diversity-optimised (blue dashed) subsets. The right panel repeats the histogram but only for designs "
+                    "that pass the RMSD threshold."
+                    if include_top_candidates
+                    else "Distribution of each metric across all designs (grey) with overlays for Diversity-optimised (blue dashed) subsets. The right panel repeats the histogram but only for designs that pass the RMSD threshold."
+                )
             ),
         )
         for m in hist_metrics:
@@ -1275,7 +1344,7 @@ class Filter(Task):
             self._hist_plus(
                 ax1,
                 self.df_full[m],
-                self.df_full[: self.top_budget][m],
+                self.df_full[: self.top_budget][m] if include_top_candidates else None,
                 self.df_div[m],
                 m, ""
             )
@@ -1283,7 +1352,7 @@ class Filter(Task):
                 self._hist_plus(
                     ax2,
                     self.df_full[self.df_full["pass_filter_rmsd_filter"]][m],
-                    self.df_full[: self.top_budget][m],
+                    self.df_full[: self.top_budget][m] if include_top_candidates else None,
                     self.df_div[m],
                     m,
                     " (Designs passing RMSD threshold)",
@@ -1327,19 +1396,20 @@ class Filter(Task):
             "A description of metrics and summarizing plots was written to:", pdf_path
         )
 
-    def _scatter_plus(self, ax, df_all, x, y, title=""):
+    def _scatter_plus(self, ax, df_all, x, y, title="", include_top_candidates=True):
 
         ax.scatter(
             df_all[x], df_all[y],
             color="lightgray", alpha=0.4, s=14, zorder=1,
         )
         # Red: top-quality from the full set
-        ax.scatter(
-            self.df_full[: self.top_budget][x],
-            self.df_full[: self.top_budget][y],
-            facecolors="none", edgecolors="red", linewidth=1.5, s=30,
-            zorder=2, alpha=0.5, label="top-quality",
-        )
+        if include_top_candidates:
+            ax.scatter(
+                self.df_full[: self.top_budget][x],
+                self.df_full[: self.top_budget][y],
+                facecolors="none", edgecolors="red", linewidth=1.5, s=30,
+                zorder=2, alpha=0.5, label="top-quality",
+            )
         # Blue: final diverse set
         if not self.df_div.empty:
             ax.scatter(
