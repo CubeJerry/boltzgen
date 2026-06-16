@@ -2,6 +2,7 @@ import pickle
 from pathlib import Path
 from typing import Dict, List
 
+import gemmi
 import numpy as np
 import torch
 from pytorch_lightning import LightningModule, Trainer
@@ -15,12 +16,11 @@ from boltzgen.data.data import (
     convert_ccd,
 )
 from boltzgen.data.feature.featurizer import (
+    res_all_gly,
     res_from_atom14,
     res_from_atom37,
-    res_all_gly,
 )
 from boltzgen.data.write.mmcif import to_mmcif
-from boltzgen.data.write.pdb import to_pdb
 from boltzgen.model.loss.diffusion import weighted_rigid_align
 from boltzgen.model.modules.masker import BoltzMasker
 
@@ -427,11 +427,8 @@ class DesignWriter(BasePredictionWriter):
                                 .squeeze()
                             )
 
-                    pdbs = []
-                    all_coords = []
-                    ensemble = []
-                    atom_idx = 0
-                    for idx, frame in tqdm(
+                    mmcifs = []
+                    for _idx, frame in tqdm(
                         enumerate(aligned), desc="Writing traj.", total=len(aligned)
                     ):
                         sample["coords"] = frame
@@ -443,18 +440,10 @@ class DesignWriter(BasePredictionWriter):
                             raise ValueError("Either atom14 or atom37 must be true")
 
                         str_frame, _, _ = Structure.from_feat(sample)
-                        pdbs.append(to_pdb(str_frame))
-                        all_coords.append(str_frame.coords)
-                        ensemble.append(
-                            (
-                                atom_idx,
-                                len(str_frame.coords),
-                            )
-                        )
-                        atom_idx += len(str_frame.coords)
+                        mmcifs.append(to_mmcif(str_frame))
 
-                    open(self.outdir / f"{file_name}_traj.pdb", "w").write(
-                        self.combine_pdb_models(pdbs)
+                    open(self.outdir / f"{file_name}_traj.cif", "w").write(
+                        self.combine_mmcif_models(mmcifs)
                     )
 
                 # Write x0 trajectories
@@ -475,11 +464,8 @@ class DesignWriter(BasePredictionWriter):
                                 .squeeze()
                             )
 
-                    pdbs = []
-                    all_coords = []
-                    ensemble = []
-                    atom_idx = 0
-                    for idx, frame in tqdm(
+                    mmcifs = []
+                    for _idx, frame in tqdm(
                         enumerate(aligned), desc="Writing x0 traj.", total=len(aligned)
                     ):
                         sample["coords"] = frame
@@ -491,18 +477,10 @@ class DesignWriter(BasePredictionWriter):
                             raise ValueError("Either atom14 or atom37 must be true")
 
                         str_frame, _, _ = Structure.from_feat(sample)
-                        pdbs.append(to_pdb(str_frame))
-                        all_coords.append(str_frame.coords)
-                        ensemble.append(
-                            (
-                                atom_idx,
-                                len(str_frame.coords),
-                            )
-                        )
-                        atom_idx += len(str_frame.coords)
+                        mmcifs.append(to_mmcif(str_frame))
 
-                    open(self.outdir / f"{file_name}_x0_traj.pdb", "w").write(
-                        self.combine_pdb_models(pdbs)
+                    open(self.outdir / f"{file_name}_x0_traj.cif", "w").write(
+                        self.combine_mmcif_models(mmcifs)
                     )
 
             except Exception as e:  # noqa: BLE001
@@ -512,18 +490,27 @@ class DesignWriter(BasePredictionWriter):
                 msg = f"predict/writer.py: Validation structure writing failed on {batch['id'][0]} with error {e}. Skipping."
                 print(msg)
 
-    def combine_pdb_models(self, pdb_strings):
-        combined_pdb = ""
-        model_number = 1
+    def combine_mmcif_models(self, mmcif_strings):
+        gemmi_structure = None
+        for model_number, mmcif_string in enumerate(mmcif_strings, start=1):
+            block = gemmi.cif.read_string(mmcif_string).sole_block()
+            frame_structure = gemmi.make_structure_from_block(block)
+            gemmi_model = frame_structure[0]
+            try:
+                gemmi_model.num = model_number
+            except AttributeError:
+                gemmi_model.name = str(model_number)
 
-        for pdb in pdb_strings:
-            # Add a model number at the start of each model
-            combined_pdb += f"MODEL     {model_number}\n"
-            combined_pdb += pdb.split("\nEND")[0]
-            combined_pdb += "\nENDMDL\n"  # End of model marker
-            model_number += 1
+            if gemmi_structure is None:
+                gemmi_structure = frame_structure
+                gemmi_structure.name = "trajectory"
+            else:
+                gemmi_structure.add_model(gemmi_model)
 
-        return combined_pdb
+        if gemmi_structure is None:
+            raise ValueError("At least one mmCIF model is required")
+
+        return gemmi_structure.make_mmcif_document().as_string()
 
     def on_predict_epoch_end(
         self,
