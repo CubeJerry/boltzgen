@@ -40,6 +40,7 @@ import math
 import re
 import shutil
 import sys
+import tempfile
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -408,6 +409,91 @@ def build_run_parser(subparsers) -> argparse.ArgumentParser:
     return run_parser
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("value must be at least 1")
+    return parsed
+
+
+def _nonnegative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("value must be at least 0")
+    return parsed
+
+
+def build_inverse_fold_parser(subparsers) -> argparse.ArgumentParser:
+    """Build the FASTA-first inverse-folding command parser."""
+    inverse_fold_parser = subparsers.add_parser(
+        "inverse-fold",
+        description="Inverse fold prepared structures directly to FASTA",
+        help="Inverse fold one or more prepared structures to a single FASTA",
+    )
+    inverse_fold_parser.add_argument(
+        "design_spec",
+        nargs="+",
+        type=Path,
+        help="Design YAML file(s), or directories containing prepared .yaml files",
+    )
+    inverse_fold_parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("sequences.fasta"),
+        help="Output FASTA path. Default: %(default)s",
+    )
+    inverse_fold_parser.add_argument(
+        "--num-sequences",
+        "--inverse_fold_num_sequences",
+        dest="num_sequences",
+        type=_positive_int,
+        default=1,
+        help="Number of inverse-folded sequences per backbone. Default: %(default)s",
+    )
+    inverse_fold_parser.add_argument(
+        "--avoid",
+        "--inverse_fold_avoid",
+        dest="avoid",
+        default="",
+        help="One-letter amino-acid codes to exclude, for example 'MC'",
+    )
+    inverse_fold_parser.add_argument(
+        "--checkpoint",
+        "--inverse_fold_checkpoint",
+        dest="checkpoint",
+        default=ARTIFACTS["inverse-fold"][0],
+        help="Path or Hugging Face reference for the inverse-fold checkpoint",
+    )
+    inverse_fold_parser.add_argument(
+        "--devices",
+        type=_positive_int,
+        help="Number of GPUs to use. Default: all visible GPUs",
+    )
+    inverse_fold_parser.add_argument(
+        "--num-workers",
+        "--num_workers",
+        dest="num_workers",
+        type=_nonnegative_int,
+        default=1,
+        help="Number of DataLoader workers. Default: %(default)s",
+    )
+    inverse_fold_parser.add_argument(
+        "--use-kernels",
+        "--use_kernels",
+        dest="use_kernels",
+        choices=["auto", "true", "false"],
+        default="auto",
+        help="Use optimized kernels: auto, true, or false. Default: %(default)s",
+    )
+    inverse_fold_parser.add_argument(
+        "--moldir",
+        default=ARTIFACTS["moldir"][0],
+        help="Path or Hugging Face reference for molecule definitions",
+    )
+    add_models_download_options(inverse_fold_parser)
+    return inverse_fold_parser
+
+
 def build_execute_parser(subparsers) -> argparse.ArgumentParser:
     execute_parser = subparsers.add_parser(
         "execute",
@@ -546,6 +632,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     build_run_parser(subparsers)
+    build_inverse_fold_parser(subparsers)
     build_configure_parser(subparsers)
     build_execute_parser(subparsers)
     build_download_parser(subparsers)
@@ -574,6 +661,139 @@ def run_command(args: argparse.Namespace) -> None:
 
     print("\n=== Executing pipeline ===")
     execute_command(args)
+
+
+def resolve_inverse_fold_design_specs(paths: List[Path]) -> List[Path]:
+    """Resolve explicit YAMLs and non-recursive YAML directories."""
+    resolved = []
+    for path in paths:
+        path = path.expanduser()
+        if path.is_dir():
+            directory_specs = sorted(
+                candidate.resolve()
+                for candidate in path.iterdir()
+                if candidate.is_file() and candidate.suffix.lower() == ".yaml"
+            )
+            if not directory_specs:
+                raise ValueError(f"No .yaml design specifications found in {path}")
+            resolved.extend(directory_specs)
+        elif path.is_file() and path.suffix.lower() == ".yaml":
+            resolved.append(path.resolve())
+        elif path.exists():
+            raise ValueError(f"Design specification must be a .yaml file: {path}")
+        else:
+            raise FileNotFoundError(f"Design specification not found: {path}")
+
+    source_ids = [path.stem for path in resolved]
+    invalid_ids = [
+        source_id
+        for source_id in source_ids
+        if not source_id or any(char.isspace() for char in source_id)
+    ]
+    if invalid_ids:
+        raise ValueError(
+            "Design YAML filenames must produce non-empty FASTA IDs without "
+            f"whitespace: {invalid_ids}"
+        )
+    duplicate_ids = sorted(
+        source_id
+        for source_id, count in collections.Counter(source_ids).items()
+        if count > 1
+    )
+    if duplicate_ids:
+        raise ValueError(
+            "Design YAML stems must be unique for FASTA provenance; duplicates: "
+            f"{duplicate_ids}"
+        )
+    return resolved
+
+
+def parse_inverse_fold_avoid(value: str) -> List[str]:
+    """Convert one-letter exclusions to unique canonical residue tokens."""
+    restrictions = []
+    for one_letter_code in value.upper():
+        token = const.prot_letter_to_token.get(one_letter_code)
+        if token not in const.canonical_tokens:
+            raise ValueError(
+                f"Unknown canonical amino-acid code in --avoid: {one_letter_code!r}"
+            )
+        if token not in restrictions:
+            restrictions.append(token)
+    return restrictions
+
+
+def resolve_inverse_fold_accelerator(
+    devices: int | None, use_kernels: str
+) -> Tuple[int, bool]:
+    """Resolve GPU count and kernel selection for inverse folding."""
+    visible_devices = torch.cuda.device_count()
+    if visible_devices < 1:
+        raise RuntimeError("BoltzGen inverse folding requires at least one visible GPU")
+    resolved_devices = devices if devices is not None else visible_devices
+    if resolved_devices > visible_devices:
+        raise ValueError(
+            f"Requested {resolved_devices} GPUs, but only {visible_devices} are visible"
+        )
+
+    if use_kernels == "auto":
+        resolved_kernels = torch.cuda.get_device_capability()[0] >= 8
+    else:
+        resolved_kernels = use_kernels == "true"
+    return resolved_devices, resolved_kernels
+
+
+def inverse_fold_command(args: argparse.Namespace) -> None:
+    """Run only inverse folding and emit one provenance-preserving FASTA."""
+    design_specs = resolve_inverse_fold_design_specs(args.design_spec)
+    restrictions = parse_inverse_fold_avoid(args.avoid)
+    devices, use_kernels = resolve_inverse_fold_accelerator(
+        args.devices, args.use_kernels
+    )
+    output_path = args.output.expanduser().resolve()
+    if output_path.is_dir():
+        raise ValueError(f"FASTA output path is a directory: {output_path}")
+    if output_path in design_specs:
+        raise ValueError("FASTA output path cannot overwrite an input design YAML")
+
+    moldir = get_artifact_path(args, args.moldir, repo_type="dataset")
+    checkpoint = get_artifact_path(args, args.checkpoint)
+    protected_artifacts = {
+        path.resolve() for path in (Path(moldir), Path(checkpoint)) if path.is_file()
+    }
+    if output_path in protected_artifacts:
+        raise ValueError(
+            "FASTA output path cannot overwrite the inverse-fold checkpoint or "
+            "molecule archive"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="boltzgen-inverse-fold-") as runtime_dir:
+        config = omegaconf.OmegaConf.load(config_dir / "inverse_fold_only.yaml")
+        config.output = runtime_dir
+        config.checkpoint = str(checkpoint)
+        config.data.cfg.yaml_path = [str(path) for path in design_specs]
+        config.data.cfg.multiplicity = args.num_sequences
+        config.data.cfg.moldir = str(moldir)
+        config.data.cfg.allow_reserved_filenames = True
+        config.data.num_workers = args.num_workers
+        config.override.use_kernels = use_kernels
+        config.override.inverse_fold_args.inverse_fold_restriction = restrictions
+        config.trainer.devices = devices
+        config.trainer.logger = False
+        config.trainer.enable_checkpointing = False
+        config.trainer.enable_model_summary = False
+        config.writer = omegaconf.OmegaConf.create(
+            {
+                "_target_": "boltzgen.task.predict.writer.InverseFoldFastaWriter",
+                "output_path": str(output_path),
+                "source_ids": [path.stem for path in design_specs],
+                "num_sequences": args.num_sequences,
+            }
+        )
+
+        task = hydra.utils.instantiate(config)
+        if not isinstance(task, Task):
+            raise TypeError("Inverse-fold config must instantiate a Task")
+        task.run(config)
 
 
 def download_command(args: argparse.Namespace) -> list[Path]:
@@ -1735,6 +1955,8 @@ def main() -> None:
 
     if args.command == "run":
         run_command(args)
+    elif args.command == "inverse-fold":
+        inverse_fold_command(args)
     elif args.command == "configure":
         configure_command(args)
     elif args.command == "execute":

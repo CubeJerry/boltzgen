@@ -27,13 +27,17 @@ _MOCK_MODULES = [
     "torch.nn.functional",
     "torch.utils",
     "torch.utils.data",
+    "torch.types",
     "pytorch_lightning",
+    "pytorch_lightning.callbacks",
     "hydra",
     "hydra.core",
     "hydra.core.config_store",
     "einops",
     "einx",
     "mashumaro",
+    "mashumaro.mixins",
+    "mashumaro.mixins.dict",
     "biotite",
     "biotite.structure",
     "biotite.structure.io",
@@ -42,6 +46,10 @@ _MOCK_MODULES = [
     "logomaker",
     "hydride",
     "gemmi",
+    "rdkit",
+    "rdkit.Chem",
+    "rdkit.Chem.rdchem",
+    "rdkit.Chem.rdMolDescriptors",
     "pdbeccdutils",
     "pdbeccdutils.core",
     "pdbeccdutils.core.ccd_reader",
@@ -77,3 +85,11 @@ def pytest_configure(config) -> None:
     if config.getoption("--mock-heavy-deps"):
         for mod in _MOCK_MODULES:
             _install_mock(mod)
+        sys.modules["mashumaro.mixins.dict"].DataClassDictMixin = type(
+            "DataClassDictMixin", (), {}
+        )
+        sys.modules["pytorch_lightning.callbacks"].BasePredictionWriter = type(
+            "BasePredictionWriter",
+            (),
+            {"__init__": lambda self, write_interval: None},
+        )

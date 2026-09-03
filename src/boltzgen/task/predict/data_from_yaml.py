@@ -41,6 +41,7 @@ class DataConfig:
     skip_offset: int = 0
     diffusion_samples: int = 1
     output_dir: Optional[str] = None
+    allow_reserved_filenames: bool = False
   
    
 
@@ -51,6 +52,30 @@ class Dataset:
     tokenizer: Tokenizer
     featurizer: Featurizer
     multiplicity: int = 1
+
+
+def validate_yaml_filenames(
+    yaml_paths: List[str], allow_reserved_filenames: bool = False
+) -> None:
+    """Validate YAML names reserved by the structural prediction writer."""
+    if allow_reserved_filenames:
+        return
+
+    for path in yaml_paths:
+        filename = Path(path).name
+        if re.search(r"_\d+\.yaml$", filename):
+            raise ValueError(
+                f"Illegal YAML filename for '{path}': names must not end with the "
+                "pattern _\\d+\\.yaml so, e.g., the ends '_001.yaml' or "
+                "'_4.yaml' are not allowed. This pattern is reserved for internal "
+                "file indexing. Sorry :)"
+            )
+        if "_native" in filename:
+            raise ValueError(
+                f"Illegal YAML filename for '{path}': names must not contain "
+                "'_native' because this substring is reserved for native structure "
+                "companions. Sorry :)"
+            )
 
 
 def collate(data: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
@@ -127,6 +152,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         disulfide_prob: float = 1.0,
         disulfide_on: bool = False,
         skip_offset: int = 0,
+        allow_reserved_filenames: bool = False,
     ) -> None:
         """Initialize the training dataset.
 
@@ -146,18 +172,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         self.skip_offset = skip_offset
         path = dataset.yaml_path
         self.yaml_paths = [path] if isinstance(path, str) else path
-
-        for path in self.yaml_paths:
-            filename = Path(path).name
-            if re.search(r"_\d+\.yaml$", filename):
-                raise ValueError(
-                    f"Illegal YAML filename for '{str(path)}': names must not end with the pattern _\\d+\\.yaml so, e.g., the ends '_001.yaml' or '_4.yaml' are not allowed."
-                    "This pattern is reserved for internal file indexing. Sorry :)"
-                )
-            if "_native" in filename:
-                raise ValueError(
-                    f"Illegal YAML filename for '{str(path)}': names must not contain '_native' because this substring is reserved for native structure companions. Sorry :)"
-                )
+        validate_yaml_filenames(self.yaml_paths, allow_reserved_filenames)
         self.extra_features = (
             set(extra_features) if extra_features is not None else set()
         )
@@ -382,6 +397,7 @@ class FromYamlDataModule(pl.LightningDataModule):
             disulfide_prob=cfg.disulfide_prob,
             disulfide_on=cfg.disulfide_on,
             skip_offset=cfg.skip_offset,
+            allow_reserved_filenames=cfg.allow_reserved_filenames,
         )
 
     def predict_dataloader(self) -> DataLoader:

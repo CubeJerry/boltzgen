@@ -1294,6 +1294,8 @@ class Boltz(LightningModule):
             )
             pred_dict = {"exception": False}
             pred_dict.update(feat_masked)
+            if self.inverse_fold:
+                pred_dict["res_type"] = out["res_type"].long()
 
             if "keys_dict_batch" in self.predict_args:
                 for key in self.predict_args["keys_dict_batch"]:

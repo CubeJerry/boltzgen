@@ -128,6 +128,33 @@ BoltzGen should be run on a GPU. On the right you can see the time required for 
 
 We suggest first running with e.g. `--num_design 50`, checking that everything behaves as desired, and then increasing `--num_design` to between 10,000 - 60,000.
 
+## FASTA-only inverse folding
+
+Use the dedicated command when you already have prepared, coordinate-based design
+specifications and only want sequences:
+
+```bash
+boltzgen inverse-fold candidate_001.yaml candidate_002.yaml \
+  --output sequences.fasta \
+  --num-sequences 3 \
+  --avoid MC
+```
+
+The command loads the inverse-folding model once for all inputs and writes one FASTA
+file. It does not run backbone generation, folding/refolding, analysis, or filtering,
+and it does not create CIF, NPZ, configuration, or intermediate-result directories.
+Fixed residues come from each input structure; only positions selected by its design
+mask are replaced. Per-residue amino-acid constraints in the YAML are combined with
+the global `--avoid` exclusions.
+
+You can pass any number of `.yaml` files or directories. Directory discovery is
+non-recursive and sorted. Input filename stems must be unique because they become
+FASTA provenance IDs. With one sequence per backbone, an input named
+`candidate_001.yaml` produces `>candidate_001`; with multiple sequences it produces
+`>candidate_001__if000`, `>candidate_001__if001`, and so on. Each specification must
+contain exactly one designed protein chain; the complete sequence of that chain,
+including its fixed residues, is written.
+
 ## Pipeline output
 When the pipeline completes your output directory will have:
 - `config/`, `steps.yaml`: configuration files.
@@ -355,9 +382,11 @@ boltzgen run example/cyclotide/3ivq.yaml \
   --num_designs 2
 ```
 
-If you want to run only the inverse folding and subsequent design evaluation steps (but not the backbone design step), you can also run:
+If you want to run inverse folding and the subsequent pipeline evaluation steps (but
+not backbone design), you can also use the legacy pipeline mode below. For FASTA-only
+output, use [`boltzgen inverse-fold`](#fasta-only-inverse-folding) instead.
 
-**Run only inverse_folding step:**
+**Skip backbone design but keep downstream evaluation:**
 ```bash
 boltzgen run example/inverse_folding/1brs.yaml \
   --output workbench/if-only \
@@ -408,6 +437,26 @@ boltzgen run example/binding_disordered_peptides/tpp4.yaml \
 See [slurm-example](slurm-example).
 
 # All command line arguments
+
+## `boltzgen inverse-fold`
+
+```text
+boltzgen inverse-fold DESIGN_SPEC [DESIGN_SPEC ...]
+  [--output FASTA] [--num-sequences N] [--avoid AMINO_ACIDS]
+  [--checkpoint CHECKPOINT] [--devices N] [--num-workers N]
+  [--use-kernels {auto,true,false}] [--moldir MOLDIR]
+```
+
+- `DESIGN_SPEC` — One or more `.yaml` files or directories of `.yaml` files.
+- `--output` — Destination FASTA file. Default: `sequences.fasta`.
+- `--num-sequences` — Sequences sampled per backbone. Default: `1`.
+- `--avoid` — One-letter amino-acid codes excluded globally, such as `MC`.
+- `--checkpoint` — Local path or hosted reference for the inverse-fold checkpoint.
+- `--devices` — Number of GPUs; defaults to all visible GPUs.
+- `--num-workers` — DataLoader workers. Default: `1`.
+- `--use-kernels` — Optimized-kernel selection. `auto` enables them on compute
+  capability 8 or newer.
+- `--moldir` — Molecule-definition directory or zip file.
 
 ## `boltzgen run`
 The `boltzgen run` command executes the BoltzGen binder design pipeline. Here are all available options:

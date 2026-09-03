@@ -1,6 +1,6 @@
 import pickle
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Sequence
 
 import gemmi
 import numpy as np
@@ -155,6 +155,237 @@ class AffinityWriter(BasePredictionWriter):
         pl_module: LightningModule,  # noqa: ARG002
     ) -> None:
         print(f"Number of failed affinity predictions: {self.failed}")  # noqa: T201
+
+
+def reconstruct_inverse_fold_sequence(
+    original_token_ids: Sequence[int],
+    predicted_token_ids: Sequence[int],
+    design_mask: Sequence[bool],
+    token_pad_mask: Sequence[bool],
+    asym_ids: Sequence[int],
+    mol_types: Sequence[int],
+    token_to_res: Sequence[int],
+    token_resolved_mask: Sequence[bool] | None = None,
+) -> str:
+    """Reconstruct the complete designed protein chain as a sequence."""
+    fields = {
+        "original_token_ids": original_token_ids,
+        "predicted_token_ids": predicted_token_ids,
+        "design_mask": design_mask,
+        "token_pad_mask": token_pad_mask,
+        "asym_ids": asym_ids,
+        "mol_types": mol_types,
+        "token_to_res": token_to_res,
+    }
+    lengths = {name: len(values) for name, values in fields.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError(f"Inverse-fold token fields have different lengths: {lengths}")
+    if token_resolved_mask is not None and len(token_resolved_mask) != len(design_mask):
+        raise ValueError("token_resolved_mask has a different length from design_mask")
+
+    protein_id = const.chain_type_ids["PROTEIN"]
+    designed_indices = [
+        index
+        for index, is_designed in enumerate(design_mask)
+        if is_designed and token_pad_mask[index] and mol_types[index] == protein_id
+    ]
+    if not designed_indices:
+        raise ValueError("No designed protein residues were found")
+
+    if token_resolved_mask is not None:
+        unresolved = [
+            index for index in designed_indices if not token_resolved_mask[index]
+        ]
+        if unresolved:
+            raise ValueError(
+                "Designed protein residues are unresolved at token indices "
+                f"{unresolved}"
+            )
+
+    designed_chain_ids = {asym_ids[index] for index in designed_indices}
+    if len(designed_chain_ids) != 1:
+        raise ValueError(
+            "FASTA inverse folding requires exactly one designed protein chain; "
+            f"found {len(designed_chain_ids)}"
+        )
+    designed_chain_id = next(iter(designed_chain_ids))
+
+    merged_token_ids = list(original_token_ids)
+    for index in designed_indices:
+        predicted_token = const.tokens[predicted_token_ids[index]]
+        if predicted_token not in const.canonical_tokens:
+            raise ValueError(
+                f"Inverse fold predicted non-canonical token {predicted_token!r} "
+                f"at token index {index}"
+            )
+        merged_token_ids[index] = predicted_token_ids[index]
+
+    sequence = []
+    seen_residues = set()
+    for index, token_id in enumerate(merged_token_ids):
+        if (
+            not token_pad_mask[index]
+            or mol_types[index] != protein_id
+            or asym_ids[index] != designed_chain_id
+        ):
+            continue
+        residue_key = (asym_ids[index], token_to_res[index])
+        if residue_key in seen_residues:
+            continue
+        seen_residues.add(residue_key)
+        token = const.tokens[token_id]
+        try:
+            sequence.append(const.prot_token_to_letter[token])
+        except KeyError as exc:
+            raise ValueError(
+                f"Cannot represent protein token {token!r} in FASTA"
+            ) from exc
+
+    if not sequence:
+        raise ValueError("The designed protein chain is empty")
+    return "".join(sequence)
+
+
+class InverseFoldFastaWriter(BasePredictionWriter):
+    """Write inverse-folded binder sequences directly from model predictions."""
+
+    def __init__(
+        self,
+        output_path: str,
+        source_ids: Sequence[str],
+        num_sequences: int = 1,
+    ) -> None:
+        super().__init__(write_interval="batch")
+        self.output_path = Path(output_path)
+        self.source_ids = list(source_ids)
+        if num_sequences < 1:
+            raise ValueError("num_sequences must be at least 1")
+        if len(set(self.source_ids)) != len(self.source_ids):
+            raise ValueError("source_ids must be unique")
+        self.source_order = {
+            source_id: index for index, source_id in enumerate(self.source_ids)
+        }
+        self.num_sequences = num_sequences
+        self.records: list[tuple[str, int, str]] = []
+        self.failures: list[str] = []
+
+    def write_on_batch_end(
+        self,
+        trainer: Trainer = None,  # noqa: ARG002
+        pl_module: LightningModule = None,  # noqa: ARG002
+        prediction: Dict[str, Tensor] = None,
+        batch_indices: List[int] = None,  # noqa: ARG002
+        batch: Dict[str, Tensor] = None,
+        batch_idx: int = None,  # noqa: ARG002
+        dataloader_idx: int = 0,  # noqa: ARG002
+    ) -> None:
+        """Collect one sequence record from an inverse-fold prediction."""
+        source_id = str(batch["id"][0])
+        if prediction.get("exception", False) or prediction.get("skip", False):
+            self.failures.append(source_id)
+            return
+
+        mask_key = (
+            "inverse_fold_design_mask"
+            if "inverse_fold_design_mask" in batch
+            else "design_mask"
+        )
+        resolved_mask = (
+            batch["token_resolved_mask"][0].detach().cpu().bool().tolist()
+            if "token_resolved_mask" in batch
+            else None
+        )
+        try:
+            sequence = reconstruct_inverse_fold_sequence(
+                original_token_ids=torch.argmax(batch["res_type"][0], dim=-1)
+                .detach()
+                .cpu()
+                .tolist(),
+                predicted_token_ids=torch.argmax(
+                    prediction["res_type"][0], dim=-1
+                )
+                .detach()
+                .cpu()
+                .tolist(),
+                design_mask=batch[mask_key][0].detach().cpu().bool().tolist(),
+                token_pad_mask=batch["token_pad_mask"][0]
+                .detach()
+                .cpu()
+                .bool()
+                .tolist(),
+                asym_ids=batch["asym_id"][0].detach().cpu().tolist(),
+                mol_types=batch["mol_type"][0].detach().cpu().tolist(),
+                token_to_res=batch["token_to_res"][0].detach().cpu().tolist(),
+                token_resolved_mask=resolved_mask,
+            )
+        except (KeyError, ValueError) as exc:
+            self.failures.append(f"{source_id}: {exc}")
+            return
+        sample_idx = (
+            int(batch["data_sample_idx"][0])
+            if "data_sample_idx" in batch
+            else 0
+        )
+        self.records.append((source_id, sample_idx, sequence))
+
+    def on_predict_epoch_end(
+        self,
+        trainer: Trainer,
+        pl_module: LightningModule,  # noqa: ARG002
+    ) -> None:
+        """Gather records across ranks and atomically write the final FASTA."""
+        payloads = [{"records": self.records, "failures": self.failures}]
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            payloads = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(
+                payloads,
+                {"records": self.records, "failures": self.failures},
+            )
+
+        records = {}
+        failures = []
+        for payload in payloads:
+            failures.extend(payload["failures"])
+            for source_id, sample_idx, sequence in payload["records"]:
+                records.setdefault((source_id, sample_idx), sequence)
+
+        expected_keys = {
+            (source_id, sample_idx)
+            for source_id in self.source_ids
+            for sample_idx in range(self.num_sequences)
+        }
+        if set(records) != expected_keys:
+            raise RuntimeError(
+                f"Inverse folding produced {len(records)} of {len(expected_keys)} "
+                "expected sequences; "
+                f"missing: {sorted(expected_keys - set(records))}; "
+                f"unexpected: {sorted(set(records) - expected_keys)}; "
+                f"failures: {sorted(set(failures))}"
+            )
+        if not trainer.is_global_zero:
+            return
+
+        width = max(3, len(str(self.num_sequences - 1)))
+        output = []
+        for (source_id, sample_idx), sequence in sorted(
+            records.items(),
+            key=lambda item: (
+                self.source_order[item[0][0]],
+                item[0][1],
+            ),
+        ):
+            record_id = (
+                source_id
+                if self.num_sequences == 1
+                else f"{source_id}__if{sample_idx:0{width}d}"
+            )
+            output.append(f">{record_id}\n{sequence}")
+
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.output_path.with_name(f".{self.output_path.name}.tmp")
+        temporary_path.write_text("\n".join(output) + "\n")
+        temporary_path.replace(self.output_path)
+        print(f"Wrote {len(records)} inverse-folded sequences to {self.output_path}")
 
 
 class DesignWriter(BasePredictionWriter):
